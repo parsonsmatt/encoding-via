@@ -1,4 +1,4 @@
-{-# LANGUAGE AllowAmbiguousTypes  #-}
+{-# LANGUAGE TypeOperators, AllowAmbiguousTypes  #-}
 {-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE DeriveGeneric        #-}
 {-# LANGUAGE DerivingStrategies   #-}
@@ -30,6 +30,8 @@ import           GHC.Generics
 import           GHC.TypeLits
 import qualified Data.ByteString.Lazy.Char8 as BS8
 
+-- $> :set -XTypeApplications -XTypeOperators -XDataKinds
+
 p :: ToJSON a => a -> IO ()
 p = BS8.putStrLn . encode
 
@@ -40,20 +42,8 @@ data User = User
     }
     deriving stock (Show, Generic)
 
-data Dog = Dog
-    { dogName :: String
-    , dogAge :: Int
-    , dogFavoritePerson :: String
-    , dogDarkestSecret :: String
-    }
-    deriving stock (Show, Generic)
-    deriving ToJSON via Codec (Generically AsIs) Dog
-
 bob :: User
 bob = User "Bob" 32 "cats"
-
-dog :: Dog
-dog = Dog "Redneck" 4 "Bob" "i am a good boy"
 
 -- | A newtype wrapper that allows us to propagate changes to the
 -- underlying encoding.
@@ -69,189 +59,100 @@ newtype Codec (tag :: k) (a :: Type) = Codec { unCodec :: a }
 codec :: forall tag a. a -> Codec tag a
 codec = Codec
 
--- | We want to have an "as-is" thing, that does not modify the underlying
--- ToJSON instance at all.
-data Underlying'
+-- | Sometimes you just want to use the underlying representation.
+type AsIs = ()
 
-instance ToJSON a => ToJSON (Codec Underlying' a) where
+instance ToJSON a => ToJSON (Codec AsIs a) where
     toJSON (Codec a) = toJSON a
 
-
--- | We also want a way to say "Use the Generic instance, please"
-data Generically'
+-- | Sometimes you want to use a generic representation.
+data Generically
 
 instance
     (GToJSON Zero (Rep a), Generic a, Typeable a)
   =>
-    ToJSON (Codec Generically' a)
+    ToJSON (Codec Generically a)
   where
     toJSON (Codec a) = genericToJSON defaultOptions a
 
--- Note how this isn't going to require a ToJSON instance on 'User'. We can
--- just delegate to the generic instance directly.
---
+-- | Sometimes you want to modify a representation.
+data a & b
 
--- | Now, we might want options here. The tick/prime/whatever in
--- Generically' is a hint that we'll be doing something a tiny bit fancier.
--- We want to compose modifications to the 'defaultOptions' value. So we
--- add a type variable to 'Generically' and we'll recurse on that.
---
--- How do we do type-level recursion and reify values? With type classes!
-data Generically next
+infixr 6 &
 
 instance
-    (GToJSON Zero (Rep a), Generic a, Typeable a
-    , ModifyOptions next
-    )
+    (GToJSON Zero (Rep a), Generic a, Typeable a, ModifyOptions b)
   =>
-    ToJSON (Codec (Generically next) a)
+    ToJSON (Codec (Generically & b) a)
   where
-    toJSON (Codec a) = genericToJSON (modifyOptions @next defaultOptions) a
+    toJSON (Codec a) = genericToJSON (modifyOptions @b defaultOptions) a
 
--- | This type class allows us to modify options. This isn't obviously
--- recursive, but we can make it more obvious by starting with the base
--- case.
-class ModifyOptions next where
+class ModifyOptions tag where
     modifyOptions :: Options -> Options
 
--- | The base case to the recursion in ModifyOptions. Don't change them at
--- all!
-data AsIs
+instance (ModifyOptions a, ModifyOptions b) => ModifyOptions (a & b) where
+    modifyOptions = modifyOptions @a . modifyOptions @b
 
-instance ModifyOptions AsIs where
-    modifyOptions = id
+data Drop a
 
+precomposeFields :: (String -> String) -> Options -> Options
+precomposeFields f options = options
+    { fieldLabelModifier =
+        f . fieldLabelModifier options
+    }
 
--- | A common thing you want to do is drop a prefix. We'll leave the prefix
--- as a type variable, and provide a next variable to allow composition.
-data Drop prefix next
+instance (KnownSymbol a) => ModifyOptions (Drop a) where
+    modifyOptions =
+        precomposeFields (drop (length (symbolVal (Proxy @a))))
 
--- | The common structure of dropping a prefix is going to be pretty
--- boring, but we're going to have a number of *kinds* of prefixes that
--- we'll want to drop. So we create a delegation class, 'HasDrop', that
--- contains the actual dropping logic.
-instance
-    ( ModifyOptions next
-    , HasDrop symbol
-    )
-  =>
-    ModifyOptions (Drop symbol next)
-  where
-    modifyOptions options = next
-        { fieldLabelModifier =
-            hasDrop @symbol . fieldLabelModifier next
-        }
-      where
-        next = modifyOptions @next options
+data SnakeCase
 
--- | 'ModifyOptions (Drop symbol next)' delegates to this thing.
-class HasDrop symbol where
-    hasDrop :: String -> String
+instance ModifyOptions SnakeCase where
+    modifyOptions = precomposeFields snakeCase
 
--- | If it's a 'Symbol', then we drop the symbol.
-instance (KnownSymbol symbol) => HasDrop  symbol where
-    hasDrop field =
-        maybe field id (List.stripPrefix prefix field)
-      where
-        prefix = symbolVal (Proxy @symbol)
+-- $> p $ codec @(Generically & SnakeCase & Drop "user") bob
 
+data Dog = Dog
+    { dogName :: String
+    , dogAge :: Int
+    , dogFavoritePerson :: String
+    , dogDarkestSecret :: String
+    }
+    deriving stock (Show, Generic)
+    deriving
+        ToJSON
+      via
+        Codec
+            (Censor (OmitField "darkest_secret")
+                & Generically
+                & SnakeCase
+                & Drop "dog")
+            Dog
 
--- | But you often want to drop the type name. That's common.
--- So let's implement another helper that drops the type name.
-data TypeName a
+dog :: Dog
+dog = Dog "Redneck" 4 "Bob" "i am a good boy"
 
-instance (Typeable a) => HasDrop (TypeName a) where
-    hasDrop field =
-        case someSymbolVal typeName of
-            SomeSymbol (prxy :: Proxy symbol) ->
-                hasDrop @symbol field
-      where
-        typeName =
-            lowerFirst $ show (typeRepTyCon (typeRep (Proxy @a)))
-        lowerFirst [] = []
-        lowerFirst (c : cs) = toLower c : cs
+-- $> p dog
+-- {"age":4,"name":"Redneck","favorite_person":"Bob"}
 
---
--- Oh! Oh no. That actually does not work. The string is "User" for the
--- type name, but the field is "userThing"
+data Censor tag
 
--- | Now we also want to do some snake casing.
-data SnakeCasing next
+instance (ToJSON (Codec rest a), HasCensor tag) => ToJSON (Codec (Censor tag & rest) a) where
+    toJSON (Codec a) = censor @tag (toJSON (codec @rest a))
 
-instance (ModifyOptions next) => ModifyOptions (SnakeCasing next) where
-    modifyOptions options =
-        next
-            { fieldLabelModifier =
-                snakeCase . fieldLabelModifier next
-            }
-      where
-        next = modifyOptions @next options
+class HasCensor tag where
+    censor :: Value -> Value
 
--- ok, that's enough for generic modification.
--- What about modifying the actual JSON object?
--- Codec could use 'Underlying'' to delegate to a preexisting underlying
--- ToJSON instance.
---
---
---
--- Maybe we want to map all the fields to match some other format.
+instance (HasCensor a, HasCensor b) => HasCensor (a & b) where
+    censor = censor @a . censor @b
 
-data Underlying next
+data OmitField symbol
 
-instance (HasModifier next, ToJSON a) => ToJSON (Codec (Underlying next) a) where
-    toJSON (Codec a) = valueModifier @next (toJSON a)
-
-class HasModifier tag where
-    valueModifier :: Value -> Value
-
-instance HasModifier AsIs where
-    valueModifier = id
-
-data MapFields tag next
-
-instance
-    ( HasFieldMapper tag
-    , HasModifier next
-    )
-  =>
-    HasModifier (MapFields tag next)
-  where
-    valueModifier = overObjectFields (fieldMapper @tag) . valueModifier @next
-      where
-        overObjectFields f (Object o) =
-            Object
-            . HashMap.fromList
-            . map (first f)
-            . HashMap.toList $ o
-        overObjecFields _ x = x
-
-class HasFieldMapper tag where
-    fieldMapper :: Text -> Text
-
-instance (HasFieldMapper next) => HasFieldMapper (SnakeCasing next) where
-    fieldMapper = Text.pack . snakeCase . Text.unpack
-
-instance HasFieldMapper AsIs where
-    fieldMapper = id
-
-data OmitField sym next
-
-instance
-    ( HasModifier next
-    , KnownSymbol sym
-    )
-  =>
-    HasModifier (OmitField sym next)
-  where
-    valueModifier v = case v of
+instance (KnownSymbol symbol) => HasCensor (OmitField symbol) where
+    censor val = case val of
         Object o ->
-            Object $ HashMap.delete (Text.pack (symbolVal (Proxy @sym))) o
-        x ->
-            x
--- λ> toJSON $ codec @(Generically (SnakeCasing (Drop (TypeName Dog) AsIs))) dog
--- Object (fromList [("darkest_secret",String "i am a good boy"),("age",Number 4.0),("name",String
---  "Redneck"),("favorite_person",String "Bob")])
--- λ> toJSON $ codec @(Underlying (OmitField "darkest_secret" AsIs)) $ codec @(Generically (SnakeC
--- asing (Drop (TypeName Dog) AsIs))) dog
--- Object (fromList [("age",Number 4.0),("name",String "Redneck"),("favorite_person",String "Bob")
--- ])
+            Object
+            . HashMap.delete (Text.pack (symbolVal (Proxy @symbol)))
+            $ o
+        _ ->
+            val
